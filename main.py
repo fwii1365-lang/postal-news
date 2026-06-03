@@ -1,82 +1,157 @@
 
-
-from openai import OpenAI
+import feedparser
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
+from openai import OpenAI
+import urllib.parse
 
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-def analyze():
+DAYS_LIMIT = 14
+
+
+# ===== 日付フィルタ =====
+def is_recent(entry):
+    if hasattr(entry, "published_parsed") and entry.published_parsed:
+        published = datetime(*entry.published_parsed[:6])
+        return published >= datetime.now() - timedelta(days=DAYS_LIMIT)
+    return False  # 日付なしは除外
+
+
+# ===== ニュース取得 =====
+def fetch_news():
+    policy_news = []
+    business_news = []
+    seen = set()
+
+    # ===== Google News =====
+    policy_queries = [
+        "postal regulation law",
+        "postal policy reform government",
+        "postal subsidy government",
+        "universal service postal",
+        "mail delivery regulation"
+    ]
+
+    business_queries = [
+        "postal operator results",
+        "logistics company strategy",
+        "parcel delivery service change",
+        "postal company profit",
+        "delivery network expansion"
+    ]
+
+    def fetch_google(queries, target):
+        for q in queries:
+            url = "https://news.google.com/rss/search?q=" + urllib.parse.quote(q)
+            feed = feedparser.parse(url)
+
+            for e in feed.entries:
+                if is_recent(e):
+                    title = e.title.strip()
+                    if title not in seen:
+                        seen.add(title)
+                        target.append({
+                            "title": title,
+                            "date": getattr(e, "published", ""),
+                            "link": e.link
+                        })
+
+    fetch_google(policy_queries, policy_news)
+    fetch_google(business_queries, business_news)
+
+    # ===== 専門誌 =====
+    specialist = [
+        "https://postandparcel.info/feed/",
+        "https://www.postaltimes.com/feed/",
+        "https://www.supplychaindive.com/feeds/news/",
+        "https://www.logisticsmgmt.com/rss/all",
+        "https://www.joc.com/rss"
+    ]
+
+    for url in specialist:
+        feed = feedparser.parse(url)
+        for e in feed.entries:
+            if is_recent(e):
+                title = e.title.strip()
+                if title not in seen:
+                    seen.add(title)
+                    entry = {
+                        "title": title,
+                        "date": getattr(e, "published", ""),
+                        "link": e.link
+                    }
+                    # 両方に入れる（AIが判定）
+                    policy_news.append(entry)
+                    business_news.append(entry)
+
+    return policy_news, business_news
+
+
+# ===== AI分析 =====
+def analyze(policy, business):
     today = datetime.now().strftime("%Y/%m/%d")
+
+    def format_entries(entries):
+        return "\n".join(
+            [f"{e['title']} | {e['date']} | {e['link']}" for e in entries]
+        )
 
     prompt = f"""
 今日は{today}。
 
-世界中から郵政事業および物流事業に関する最新動向を収集し、整理せよ。
+以下は世界中の郵政・物流関連情報である。
 
-■対象
-・各国政府、規制当局
-・郵便事業者、物流企業
-・UPU、EUなど国際機関
-・NPO、公的機関
-・その他関連主体
+【政策候補】
+{format_entries(policy)}
 
-――――――――――――――
-
-■情報源の優先順位
-
-【レベル1・2（最優先・同順位）】
-政府、規制当局、国際機関（UPU、EU等）、公的機関
-＋
-事業者公式情報（郵便・物流、Annual Report、プレスリリース）
-
-【レベル3（専門情報：例示・非限定）】
-業界専門メディア（例：Post&Parcel、Journal of Commerce、Logistics Management、Supply Chain Dive、Postal Timesなど）
-※例示であり限定しない
-
-【レベル4（一般メディア）】
-世界中のニュース媒体（制限なし）
-
-【レベル5（補完情報）】
-ブログ、小規模媒体、専門家記事など
+【事業者候補】
+{format_entries(business)}
 
 ――――――――――――――
 
-■収集ルール
+【処理】
 
-・レベル1・2の情報を最優先として扱う
-・ただしレベル3およびレベル4の情報も並行して収集する
-・レベル5は補完情報として収集する
+① 政策・規制・制度変更を最低10件抽出
+② 事業者の動きを最低10件抽出
 
-・上記いずれかの条件に該当すれば対象とする（完全一致不要）
-・制度変更は検討段階も含める
-・政策、規制、補助、ユニバーサルサービスを重視
-・事業者の動き（料金、効率化、AI、提携等）も対象
+③ 各ニュースについて以下を必ず整理
+
+・When（日時）
+・Who（主体）
+・What（内容）
+・Where（対象地域）
+・Why（背景）
+・How（手段）
+
+④ 要約は以下とする
+
+・原則 10〜15行程度
+・制度・規制・財務など複雑なものは20〜30行程度まで許容
+・短すぎて意味が分からない要約は禁止
+
+⑤ 各記事について必ず以下を明示
+
+・入手元（媒体名・機関）
+・日付
+・URL
+
+⑥ 重複は統合
+
+⑦ 不足する場合は関連性の高い情報で補完
 
 ――――――――――――――
 
-■出力
-
-① 最近の重要ニュースを最低10件抽出する
-
-② 各ニュースについて：
-・5行程度で要約
-・分類（政策・規制・制度変更／事業者の動き）
-・URLを必ず記載
-
-③ レベル表示を必ず行う
-（レベル3・レベル4・レベル5は必ず明示する）
-※レベル1・2は明示不要
+■ 政策・規制・制度変更（政府・規制・国際機関）
+■ 事業者の動き
 
 ――――――――――――――
 
-■禁止事項
+【禁止】
 
+・該当なし
 ・一般論
-・調査方法の説明
-・「該当なし」の出力
-・URLが存在しない情報の作成
-
+・推測
 """
 
     res = client.chat.completions.create(
@@ -86,6 +161,11 @@ def analyze():
 
     return res.choices[0].message.content
 
+
+# ===== 実行 =====
 if __name__ == "__main__":
-    report = analyze()
+    policy, business = fetch_news()
+    report = analyze(policy, business)
+
+    print(f"【郵政・物流ニュース {datetime.now().strftime('%Y/%m/%d')}】\n")
     print(report)
